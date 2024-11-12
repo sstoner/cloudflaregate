@@ -2,53 +2,34 @@
 package cloudflaregate
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
+type contextKey string
+
 const (
-	cloudflareURL          = "https://www.cloudflare.com"
-	refreshInterval        = 24 * time.Hour
-	defaultRefreshInterval = 24 * time.Hour
-	minimumRefreshInterval = time.Second
-	bitsPerByte            = 8
-	lastBitIdx             = bitsPerByte - 1
-	maxBitMask             = 1
+	// CTXHTTPTimeout is the context key for the HTTP timeout.
+	CTXHTTPTimeout contextKey = "HTTPTimeout"
+	// CTXTrustedIPs is the context key for the trusted IP ranges.
+	CTXTrustedIPs contextKey = "TrustedIPs"
+	// CFAPI is the Cloudflare API URL.
+	CFAPI = "https://api.cloudflare.com/client/v4/ips"
+	// HTTPTimeoutDefault is the default HTTP timeout in seconds.
+	HTTPTimeoutDefault = 5
 )
-
-// HTTPClient interface for making HTTP requests.
-type HTTPClient interface {
-	Get(url string) (*http.Response, error)
-}
-
-// Node represents a node in the IP prefix tree.
-type Node struct {
-	left    *Node      // 0
-	right   *Node      // 1
-	network *net.IPNet // CIDR if this is a leaf node
-}
-
-// IPTree represents a prefix tree for fast IP lookup.
-type IPTree struct {
-	mu         sync.RWMutex
-	v4Root     *Node
-	v6Root     *Node
-	client     HTTPClient
-	baseURL    string
-	allowedIPs []string // Store custom allowed IPs
-}
 
 // Config the plugin configuration.
 type Config struct {
-	// StrictMode enables strict mode, which validates cloudflare ip address.
-	StrictMode bool `json:"strictMode,omitempty"`
 	// RefreshInterval is the interval between IP range updates
 	RefreshInterval string `json:"refreshInterval,omitempty"`
 	// AllowedIPs is a list of custom IP addresses or CIDR ranges that are allowed
@@ -58,296 +39,243 @@ type Config struct {
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		StrictMode:      true,
 		RefreshInterval: "24h",
 	}
 }
 
-// CloudflareGate is a CloudflareGate plugin.
-type CloudflareGate struct {
-	next        http.Handler
-	ipTree      *IPTree
-	strictMode  bool
-	name        string
-	stopRefresh chan struct{} // Channel to stop the refresh goroutine
+type ipstore struct {
+	cfAPI string
+	atomic.Value
+	// cidrs []net.IPNet
 }
 
-// NewNode is a constructor function for Node.
-func NewNode() *Node {
-	return &Node{}
-}
-
-// Contains checks if the given IP address is in the IP prefix tree.
-func (t *IPTree) Contains(ip net.IP) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	ipv4 := ip.To4()
-	root := t.v4Root
-	if ipv4 == nil {
-		ip = ip.To16()
-		root = t.v6Root
-	} else {
-		ip = ipv4
+func newIPStore(cfURL string) *ipstore {
+	ips := &ipstore{
+		cfAPI: cfURL,
 	}
+	ips.Store([]net.IPNet{})
+	return ips
+}
 
-	current := root
-	for i := 0; i < len(ip)*8 && current != nil; i++ {
-		if current.network != nil && current.network.Contains(ip) {
+func (ips *ipstore) Contains(ip net.IP) bool {
+	cidrs, ok := ips.Load().([]net.IPNet)
+	if !ok {
+		return false
+	}
+	for _, ipNet := range cidrs {
+		if ipNet.Contains(ip) {
 			return true
 		}
-
-		byteIndex := i / bitsPerByte
-		bitIndex := lastBitIdx - (i % bitsPerByte)
-		bit := (ip[byteIndex] >> bitIndex) & maxBitMask
-
-		if bit == 0 {
-			current = current.left
-		} else {
-			current = current.right
-		}
 	}
+
 	return false
 }
 
-// Update updates both Cloudflare and custom allowed IP ranges.
-func (t *IPTree) Update() error {
-	newV4Root := NewNode()
-	newV6Root := NewNode()
-
-	// First, add custom allowed IPs
-	for _, cidr := range t.allowedIPs {
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			// Try parsing as a single IP
-			ip := net.ParseIP(cidr)
-			if ip == nil {
-				return fmt.Errorf("invalid IP or CIDR: %s", cidr)
-			}
-			// Convert single IP to CIDR
-			if ip.To4() != nil {
-				_, network, _ = net.ParseCIDR(fmt.Sprintf("%s/32", ip))
-			} else {
-				_, network, _ = net.ParseCIDR(fmt.Sprintf("%s/128", ip))
-			}
-		}
-		t.insertIntoNode(newV4Root, newV6Root, network)
+// Update fetches the latest Cloudflare IP ranges and updates the store.
+func (ips *ipstore) Update(ctx context.Context) error {
+	trustedIPs, ok := ctx.Value(CTXTrustedIPs).([]net.IPNet)
+	if !ok {
+		return errors.New("invalid trusted IPs value")
 	}
 
-	// Then fetch and add Cloudflare IPs
-	if t.baseURL != "" {
-		v4URL := t.baseURL + "/ips-v4"
-		v6URL := t.baseURL + "/ips-v6"
-
-		v4ranges, err := t.fetchRanges(v4URL)
-		if err != nil {
-			return err
-		}
-
-		v6ranges, err := t.fetchRanges(v6URL)
-		if err != nil {
-			return err
-		}
-
-		// Add Cloudflare IPv4 ranges
-		for _, cidr := range v4ranges {
-			_, network, err := net.ParseCIDR(cidr)
-			if err != nil {
-				continue
-			}
-			t.insertIntoNode(newV4Root, newV6Root, network)
-		}
-
-		// Add Cloudflare IPv6 ranges
-		for _, cidr := range v6ranges {
-			_, network, err := net.ParseCIDR(cidr)
-			if err != nil {
-				continue
-			}
-			t.insertIntoNode(newV4Root, newV6Root, network)
-		}
+	fetchedCIDRs, err := ips.fetch(ctx)
+	if err != nil {
+		return err
 	}
 
-	// Atomically swap the new trees in
-	t.mu.Lock()
-	t.v4Root = newV4Root
-	t.v6Root = newV6Root
-	t.mu.Unlock()
+	cidrs := make([]net.IPNet, 0, len(trustedIPs)+len(fetchedCIDRs))
+	cidrs = append(cidrs, trustedIPs...)
+	cidrs = append(cidrs, fetchedCIDRs...)
 
-	return nil
+	ips.Store(cidrs)
+	return nil // Return nil if everything is successful
 }
 
-// insertIntoNode inserts a network into the appropriate tree.
-func (t *IPTree) insertIntoNode(v4Root, v6Root *Node, network *net.IPNet) {
-	ip := network.IP.To4()
-	root := v4Root
-	if ip == nil {
-		ip = network.IP.To16()
-		root = v6Root
+func (ips *ipstore) fetch(ctx context.Context) ([]net.IPNet, error) {
+	timeout, ok := ctx.Value(CTXHTTPTimeout).(int) // Ensure timeout is of type int
+	if !ok {
+		return nil, errors.New("invalid timeout value")
 	}
 
-	ones, _ := network.Mask.Size()
-	current := root
-	for i := range ones {
-		byteIndex := i / bitsPerByte
-		bitIndex := lastBitIdx - (i % bitsPerByte)
-		bit := (ip[byteIndex] >> bitIndex) & 1
-
-		if bit == 0 {
-			if current.left == nil {
-				current.left = NewNode()
-			}
-			current = current.left
-		} else {
-			if current.right == nil {
-				current.right = NewNode()
-			}
-			current = current.right
-		}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ips.cfAPI, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	current.network = network
-}
 
-// UpdateAllowedIPs updates the custom allowed IP list and refreshes the tree.
-func (t *IPTree) UpdateAllowedIPs(newAllowedIPs []string) error {
-	t.allowedIPs = newAllowedIPs
-	return t.Update()
-}
+	client := http.Client{
+		Timeout: time.Duration(timeout) * time.Second,
+	}
 
-// New created a new CloudflareGate plugin.
-func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// Parse refresh interval
-	refreshInterval := defaultRefreshInterval
-	if config.RefreshInterval != "" {
-		interval, err := time.ParseDuration(config.RefreshInterval)
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer func() {
+		err = res.Body.Close()
 		if err != nil {
-			return nil, fmt.Errorf("invalid refresh interval: %w", err)
+			log.Printf("failed to close response body: %v", err)
 		}
-		if interval < minimumRefreshInterval {
-			return nil, fmt.Errorf("refresh interval must be at least %v", minimumRefreshInterval)
-		}
-		refreshInterval = interval
+	}()
+
+	// Check for a successful response
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected response status: %s", res.Status)
 	}
 
-	ipTree := NewIPTree(http.DefaultClient, cloudflareURL)
-	ipTree.allowedIPs = config.AllowedIPs
-
-	// Initial update
-	if err := ipTree.Update(); err != nil {
-		return nil, fmt.Errorf("failed to initialize IP ranges: %w", err)
+	resp := CFResponse{}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	cg := &CloudflareGate{
-		ipTree:      ipTree,
-		strictMode:  config.StrictMode,
-		next:        next,
-		name:        name,
-		stopRefresh: make(chan struct{}),
+	err = json.Unmarshal(body, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
-	// Start background refresh with configured interval
-	go cg.refreshLoop(ctx, refreshInterval)
-
-	return cg, nil
+	return parseResponse(resp)
 }
 
-func (cg *CloudflareGate) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+// CFResponse is a Cloudflare API response.
+type CFResponse struct {
+	/*
+		{
+			"result":{
+				"ipv4_cidrs":["173.245.48.0/20","103.21.244.0/22","103.22.200.0/22","103.31.4.0/22","141.101.64.0/18","108.162.192.0/18","190.93.240.0/20","188.114.96.0/20","197.234.240.0/22","198.41.128.0/17","162.158.0.0/15","104.16.0.0/13","104.24.0.0/14","172.64.0.0/13","131.0.72.0/22"],
+				"ipv6_cidrs":["2400:cb00::/32","2606:4700::/32","2803:f800::/32","2405:b500::/32","2405:8100::/32","2a06:98c0::/29","2c0f:f248::/32"],
+				"etag":"38f79d050aa027e3be3865e495dcc9bc"
+				},
+			"success":true,
+			"errors":[],
+			"messages":[]
+		}
+	*/
+	Result   CFResponseResult    `json:"result"`
+	Success  bool                `json:"success"`
+	Errors   []CFResponseMessage `json:"errors"`
+	Messages []CFResponseMessage `json:"messages"`
+}
+
+// CFResponseResult is a response result.
+type CFResponseResult struct {
+	// IPv4CIDRs is a list of IPv4 CIDR ranges that Cloudflare uses.
+	IPv4CIDRs []string `json:"ipv4_cidrs"` //nolint:tagliatelle
+	// IPv6CIDRs is a list of IPv6 CIDR ranges that Cloudflare uses.
+	IPv6CIDRs []string `json:"ipv6_cidrs"` //nolint:tagliatelle
+	// ETag is a unique identifier for the response.
+	ETag string `json:"etag"`
+}
+
+// CFResponseMessage is a response message.
+type CFResponseMessage struct {
+	// Code is a message code.
+	Code int `json:"code"`
+	// Message is a human-readable message.
+	Message string `json:"message"`
+}
+
+// CloudflareGate is a CloudflareGate plugin.
+type CloudflareGate struct {
+	next http.Handler
+
+	name string
+	ips  *ipstore
+
+	refreshInterval time.Duration
+	trustedIPs      []net.IPNet
+}
+
+// NewCloudflareGate creates a new CloudflareGate plugin.
+func NewCloudflareGate(next http.Handler, config *Config) (*CloudflareGate, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ips := newIPStore(CFAPI)
+
+	refreshInterval, err := time.ParseDuration(config.RefreshInterval)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse refresh interval: %w", err)
+	}
+
+	trustedIPs, err := parseCIDRs(config.AllowedIPs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse trusted IPs: %w", err)
+	}
+
+	ctxUpdate := createContext(ctx, HTTPTimeoutDefault, trustedIPs)
+
+	if err := ips.Update(ctxUpdate); err != nil {
+		return nil, fmt.Errorf("failed to update Cloudflare IP ranges: %w", err)
+	}
+
+	cf := &CloudflareGate{
+		next: next,
+		name: "CloudflareGate",
+
+		ips:             ips,
+		trustedIPs:      trustedIPs,
+		refreshInterval: refreshInterval,
+	}
+
+	go cf.refreshLoop(ctx)
+	return cf, nil
+}
+
+func (cf *CloudflareGate) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	remoteIP := net.ParseIP(strings.Split(req.RemoteAddr, ":")[0])
-	if remoteIP == nil || !cg.ipTree.Contains(remoteIP) {
+	if remoteIP == nil || !cf.ips.Contains(remoteIP) {
 		http.Error(rw, "Forbidden", http.StatusForbidden)
 		return
 	}
 
-	if !cg.strictMode {
-		cg.next.ServeHTTP(rw, req)
-		return
-	}
-
-	// check request source ip
-	cfConnectingIP := net.ParseIP(strings.Split(req.RemoteAddr, ":")[0])
-	// CF-Connecting-IP is the IP address of the client connecting to Cloudflare's network
-	// cfConnectingIP := net.ParseIP(req.Header.Get("CF-Connecting-IP"))
-	if cfConnectingIP == nil || !cg.ipTree.Contains(cfConnectingIP) {
-		http.Error(rw, "Forbidden", http.StatusForbidden)
-		return
-	}
-
-	cg.next.ServeHTTP(rw, req)
-}
-
-// NewIPTree is a constructor function for IPTree.
-func NewIPTree(client HTTPClient, baseURL string) *IPTree {
-	if client == nil {
-		client = http.DefaultClient
-	}
-	if baseURL == "" {
-		baseURL = "https://www.cloudflare.com"
-	}
-	return &IPTree{
-		v4Root:  NewNode(),
-		v6Root:  NewNode(),
-		client:  client,
-		baseURL: baseURL,
-	}
+	cf.next.ServeHTTP(rw, req)
 }
 
 // refreshLoop periodically updates the IP ranges.
-func (cg *CloudflareGate) refreshLoop(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
+func (cf *CloudflareGate) refreshLoop(ctx context.Context) {
+	ticker := time.NewTicker(cf.refreshInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-cg.stopRefresh:
-			return
+
 		case <-ticker.C:
-			if err := cg.ipTree.Update(); err != nil {
+			ctxUpdate := createContext(ctx, HTTPTimeoutDefault, cf.trustedIPs)
+
+			if err := cf.ips.Update(ctxUpdate); err != nil {
 				log.Printf("Failed to update Cloudflare IP ranges: %v", err)
 			}
 		}
 	}
 }
 
-// Close stops the refresh goroutine.
-func (cg *CloudflareGate) Close() error {
-	close(cg.stopRefresh)
-	return nil
+func createContext(ctx context.Context, timeout int, trustedIPs []net.IPNet) context.Context {
+	ctx = context.WithValue(ctx, CTXHTTPTimeout, timeout)
+	return context.WithValue(ctx, CTXTrustedIPs, trustedIPs)
 }
 
-// fetchRanges fetches IP ranges from the given URL.
-func (t *IPTree) fetchRanges(url string) ([]string, error) {
-	if t.client == nil || t.baseURL == "" {
-		return nil, nil // Return empty if no client or URL is configured
-	}
-
-	resp, err := t.client.Get(url)
+func parseResponse(resp CFResponse) ([]net.IPNet, error) {
+	ipv4CIDRs, err := parseCIDRs(resp.Result.IPv4CIDRs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch IP ranges: %w", err)
+		return nil, fmt.Errorf("failed to parse IPv4 CIDRs: %w", err)
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			log.Printf("Error closing response body: %v", err)
+	ipv6CIDRs, err := parseCIDRs(resp.Result.IPv6CIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse IPv6 CIDRs: %w", err)
+	}
+	return append(ipv4CIDRs, ipv6CIDRs...), nil
+}
+
+func parseCIDRs(ips []string) ([]net.IPNet, error) {
+	trustedIPs := make([]net.IPNet, 0, len(ips))
+	for _, ip := range ips {
+		_, ipNet, err := net.ParseCIDR(ip)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse CIDR: %w", err)
 		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		trustedIPs = append(trustedIPs, *ipNet)
 	}
-
-	var ranges []string
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		cidr := strings.TrimSpace(scanner.Text())
-		if cidr != "" {
-			ranges = append(ranges, cidr)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading response: %w", err)
-	}
-
-	return ranges, nil
+	return trustedIPs, nil
 }

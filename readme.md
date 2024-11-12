@@ -1,13 +1,14 @@
 # Cloudflare Gate - Traefik Plugin
 
-A [Traefik](https://traefik.io) plugin that restricts access to your self-hosted applications to only allow traffic proxied through Cloudflare. This helps protect your applications from direct access attempts and ensures traffic comes through Cloudflare's security infrastructure.
+A [Traefik](https://traefik.io) plugin that restricts access to your applications to only allow traffic proxied through Cloudflare. This helps protect your applications from direct access attempts and ensures traffic comes through Cloudflare's security infrastructure.
 
-[![Build Status](https://github.com/sstoner/cloudflaregate/workflows/Main/badge.svg?branch=master)](https://github.com/sstoner/cloudflaregate/actions)
+[![Build Status](https://github.com/sstoner/cloudflaregate/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/sstoner/cloudflaregate/actions)  [![goreport](https://goreportcard.com/badge/github.com/sstoner/cloudflaregate)](https://goreportcard.com/report/github.com/sstoner/cloudflaregate) [![Latest Release](https://img.shields.io/github/v/release/sstoner/cloudflaregate)](https://github.com/sstoner/cloudflaregate/releases/latest)
 
 ## Features
 
 - Validates that incoming requests originate from Cloudflare's IP ranges
 - Automatic periodic updates of Cloudflare IP ranges
+- Allow additional IP addresses or CIDR ranges
 
 ## Configuration
 
@@ -35,8 +36,6 @@ http:
     cloudflare-gate:
       plugin:
         cloudflaregate:
-          # Optional: enable strict checking of source ips.
-          strictMode: true
           # Optional: configure IP ranges refresh interval (default: 24h)
           refreshInterval: "24h"
           # Allow internal traffic
@@ -63,7 +62,6 @@ http:
 
 | Option           | Type       | Default | Description                                                  |
 |-----------------|------------|---------|--------------------------------------------------------------|
-| `strictMode`    | boolean    | `true`  | Enables strict validation of Cloudflare IP ranges            |
 | `refreshInterval`| string    | `24h`   | Interval for updating Cloudflare IP ranges (minimum: 1s)     |
 | `allowedIPs`    | []string   | `[]`    | List of additional IP addresses or CIDR ranges to allow      |
 
@@ -88,9 +86,6 @@ experimental:
 - Validates that incoming requests originate from Cloudflare IPs
 - Periodic background updates of IP ranges
 
-### Strict Mode
-When enabled, strict mode:
-- Validates that the request originates from a Cloudflare IP
 
 ## Development
 
@@ -105,7 +100,7 @@ git clone https://github.com/sstoner/cloudflaregate
 cd cloudflaregate
 
 # Run tests
-go test ./...
+make test
 
 # Build
 go build ./...
