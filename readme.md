@@ -2,7 +2,7 @@
 
 A [Traefik](https://traefik.io) plugin that restricts access to your applications to only allow traffic proxied through Cloudflare. This helps protect your applications from direct access attempts and ensures traffic comes through Cloudflare's security infrastructure.
 
-[![Build Status](https://github.com/sstoner/cloudflaregate/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/sstoner/cloudflaregate/actions)  [![goreport](https://goreportcard.com/badge/github.com/sstoner/cloudflaregate)](https://goreportcard.com/report/github.com/sstoner/cloudflaregate) [![Latest Release](https://img.shields.io/github/v/release/sstoner/cloudflaregate)](https://github.com/sstoner/cloudflaregate/releases/latest)
+[![Build Status](https://github.com/sstoner/cloudflaregate/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/sstoner/cloudflaregate/actions)  [![Go Report](https://goreportcard.com/badge/github.com/sstoner/cloudflaregate)](https://goreportcard.com/report/github.com/sstoner/cloudflaregate)  [![Go Coverage](https://github.com/sstoner/cloudflaregate/wiki/coverage.svg)](https://github.com/sstoner/cloudflaregate/wiki/Test-coverage-report)  [![Latest Release](https://img.shields.io/github/v/release/sstoner/cloudflaregate)](https://github.com/sstoner/cloudflaregate/releases/latest)
 
 ## Features
 
