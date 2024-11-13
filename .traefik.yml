@@ -4,10 +4,11 @@ iconPath: .assets/icon.png
 
 import: github.com/sstoner/cloudflaregate
 
-summary: 'Middleware to verify requests originate from Cloudflare IPs'
+summary: 'Middleware to verify requests originate from Cloudflare IPs when public access enabled.'
+
+iconPath: .assets/icon.png
 
 testData:
-  strictMode: true
   refreshInterval: "24h"
   allowedIPs:
     - "192.168.1.0/24"

@@ -322,10 +322,10 @@ func TestCloudflareGate_refreshLoop(t *testing.T) {
 
 func TestNewCloudflareGate(t *testing.T) {
 	tests := []struct {
-		name            string
-		config          *Config
-		expectedError   bool
-		expectedName    string
+		name          string
+		config        *Config
+		expectedError bool
+
 		expectedNext    http.Handler
 		expectedRefresh time.Duration
 	}{
@@ -335,8 +335,8 @@ func TestNewCloudflareGate(t *testing.T) {
 				RefreshInterval: "1m",
 				AllowedIPs:      []string{"173.245.48.0/20"},
 			},
-			expectedError:   false,
-			expectedName:    "CloudflareGate",
+			expectedError: false,
+
 			expectedNext:    http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}),
 			expectedRefresh: 1 * time.Minute,
 		},
@@ -362,8 +362,7 @@ func TestNewCloudflareGate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			nextHandler := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {})
 
-			cf, err := NewCloudflareGate(nextHandler, tt.config)
-
+			cfHandler, err := New(context.Background(), nextHandler, tt.config, "test")
 			if tt.expectedError {
 				if err == nil {
 					t.Errorf("Expected error, got nil")
@@ -371,13 +370,14 @@ func TestNewCloudflareGate(t *testing.T) {
 				return
 			}
 
+			cf, ok := cfHandler.(*CloudflareGate)
+			if !ok {
+				t.Fatalf("New() = %v", cfHandler)
+			}
+
 			if err != nil {
 				t.Errorf("Unexpected error: %v", err)
 				return
-			}
-
-			if cf.name != tt.expectedName {
-				t.Errorf("Expected name %s, got %s", tt.expectedName, cf.name)
 			}
 
 			if cf.next == nil {

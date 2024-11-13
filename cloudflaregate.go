@@ -46,7 +46,6 @@ func CreateConfig() *Config {
 type ipstore struct {
 	cfAPI string
 	atomic.Value
-	// cidrs []net.IPNet
 }
 
 func newIPStore(cfURL string) *ipstore {
@@ -185,11 +184,8 @@ type CloudflareGate struct {
 	trustedIPs      []net.IPNet
 }
 
-// NewCloudflareGate creates a new CloudflareGate plugin.
-func NewCloudflareGate(next http.Handler, config *Config) (*CloudflareGate, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+// New is the constructor for CloudflareGate.
+func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	ips := newIPStore(CFAPI)
 
 	refreshInterval, err := time.ParseDuration(config.RefreshInterval)
@@ -210,7 +206,7 @@ func NewCloudflareGate(next http.Handler, config *Config) (*CloudflareGate, erro
 
 	cf := &CloudflareGate{
 		next: next,
-		name: "CloudflareGate",
+		name: name,
 
 		ips:             ips,
 		trustedIPs:      trustedIPs,
