@@ -6,8 +6,6 @@ import: github.com/sstoner/cloudflaregate
 
 summary: 'Middleware to verify requests originate from Cloudflare IPs when public access enabled.'
 
-iconPath: .assets/icon.png
-
 testData:
   refreshInterval: "24h"
   allowedIPs:
