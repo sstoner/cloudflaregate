@@ -43,6 +43,80 @@ func CreateConfig() *Config {
 	}
 }
 
+// CloudflareGate is a CloudflareGate plugin.
+type CloudflareGate struct {
+	next http.Handler
+
+	name string
+	ips  *ipstore
+
+	refreshInterval time.Duration
+	trustedIPs      []net.IPNet
+}
+
+// New created a new CloudflareGate plugin.
+func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+	ips := newIPStore(CFAPI)
+
+	refreshInterval, err := time.ParseDuration(config.RefreshInterval)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse refresh interval: %w", err)
+	}
+
+	trustedIPs, err := parseCIDRs(config.AllowedIPs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse trusted IPs: %w", err)
+	}
+
+	ctxUpdate := createContext(ctx, HTTPTimeoutDefault, trustedIPs)
+
+	if err := ips.Update(ctxUpdate); err != nil {
+		return nil, fmt.Errorf("failed to update Cloudflare IP ranges: %w", err)
+	}
+
+	cf := &CloudflareGate{
+		next: next,
+		name: name,
+
+		ips:             ips,
+		trustedIPs:      trustedIPs,
+		refreshInterval: refreshInterval,
+	}
+
+	go cf.refreshLoop(ctx)
+	return cf, nil
+}
+
+func (cf *CloudflareGate) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	remoteIP := net.ParseIP(strings.Split(req.RemoteAddr, ":")[0])
+	if remoteIP == nil || !cf.ips.Contains(remoteIP) {
+		http.Error(rw, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	cf.next.ServeHTTP(rw, req)
+}
+
+// refreshLoop periodically updates the IP ranges.
+func (cf *CloudflareGate) refreshLoop(ctx context.Context) {
+	ticker := time.NewTicker(cf.refreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C:
+			ctxUpdate := createContext(ctx, HTTPTimeoutDefault, cf.trustedIPs)
+
+			if err := cf.ips.Update(ctxUpdate); err != nil {
+				log.Printf("Failed to update Cloudflare IP ranges: %v", err)
+			}
+		}
+	}
+}
+
 type ipstore struct {
 	cfAPI string
 	atomic.Value
@@ -171,80 +245,6 @@ type CFResponseMessage struct {
 	Code int `json:"code"`
 	// Message is a human-readable message.
 	Message string `json:"message"`
-}
-
-// CloudflareGate is a CloudflareGate plugin.
-type CloudflareGate struct {
-	next http.Handler
-
-	name string
-	ips  *ipstore
-
-	refreshInterval time.Duration
-	trustedIPs      []net.IPNet
-}
-
-// New is the constructor for CloudflareGate.
-func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	ips := newIPStore(CFAPI)
-
-	refreshInterval, err := time.ParseDuration(config.RefreshInterval)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse refresh interval: %w", err)
-	}
-
-	trustedIPs, err := parseCIDRs(config.AllowedIPs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse trusted IPs: %w", err)
-	}
-
-	ctxUpdate := createContext(ctx, HTTPTimeoutDefault, trustedIPs)
-
-	if err := ips.Update(ctxUpdate); err != nil {
-		return nil, fmt.Errorf("failed to update Cloudflare IP ranges: %w", err)
-	}
-
-	cf := &CloudflareGate{
-		next: next,
-		name: name,
-
-		ips:             ips,
-		trustedIPs:      trustedIPs,
-		refreshInterval: refreshInterval,
-	}
-
-	go cf.refreshLoop(ctx)
-	return cf, nil
-}
-
-func (cf *CloudflareGate) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	remoteIP := net.ParseIP(strings.Split(req.RemoteAddr, ":")[0])
-	if remoteIP == nil || !cf.ips.Contains(remoteIP) {
-		http.Error(rw, "Forbidden", http.StatusForbidden)
-		return
-	}
-
-	cf.next.ServeHTTP(rw, req)
-}
-
-// refreshLoop periodically updates the IP ranges.
-func (cf *CloudflareGate) refreshLoop(ctx context.Context) {
-	ticker := time.NewTicker(cf.refreshInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case <-ticker.C:
-			ctxUpdate := createContext(ctx, HTTPTimeoutDefault, cf.trustedIPs)
-
-			if err := cf.ips.Update(ctxUpdate); err != nil {
-				log.Printf("Failed to update Cloudflare IP ranges: %v", err)
-			}
-		}
-	}
 }
 
 func createContext(ctx context.Context, timeout int, trustedIPs []net.IPNet) context.Context {
