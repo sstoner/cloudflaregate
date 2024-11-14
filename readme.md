@@ -22,7 +22,7 @@ experimental:
   plugins:
     cloudflaregate:
       moduleName: github.com/sstoner/cloudflaregate
-      version: v1.0.0
+      version: v1.1.1
 ```
 
 ### Dynamic Configuration
@@ -73,19 +73,10 @@ experimental:
   plugins:
     cloudflaregate:
       moduleName: github.com/sstoner/cloudflaregate
-      version: v1.0.0
-      allowedIPs:
-        - "192.168.1.0/24"
-        - "10.0.0.0/8"
+      version: v1.1.1
 ```
 
 ## Security Features
-
-### IP Range Validation
-- Automatically fetches and updates Cloudflare's IP ranges
-- Validates that incoming requests originate from Cloudflare IPs
-- Periodic background updates of IP ranges
-
 
 ## Development
 
